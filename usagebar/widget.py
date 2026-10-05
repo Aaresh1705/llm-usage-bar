@@ -29,6 +29,39 @@ def short_error(error):
     return "no data"
 
 
+def readout_rows(sources, widget_cfg):
+    """What the readout shows, as plain data: a row per provider of
+    (key, pct, reset time or None, error word or None, stale), and whether a
+    live event earns the sparkle. Kept apart from the window so that an app
+    embedding the usage bar can draw the same readout into a window of its own."""
+    rows = []
+    for src in sources:
+        usage = src.usage
+        limit = usage.by_key(src.metric())
+        pct = float(limit["percent"]) if limit else 0.0
+        reset = parse_reset(limit["resets_at"]) if limit else None
+        # Keep showing the last known figures; the flyout explains the
+        # trouble. A metric the API never returns would otherwise read as a
+        # confident 0%.
+        error = None if limit else (short_error(usage.error) or "no data")
+        # Numbers that stopped being refreshed deserve to be trusted less:
+        # dim them rather than pretend they are live. Dimming is about age,
+        # not about whether the last poll failed - a figure from a minute
+        # ago is still worth showing at full strength.
+        age = usage.age_seconds()
+        stale = age is None or age > max(600.0, 2.0 * src.poll_interval() + 60.0)
+        rows.append((src.key, pct, reset, error, stale))
+    event = (any(live_events(src.usage) for src in sources)
+             and bool(widget_cfg.get("show_events", True)))
+    return rows, event
+
+
+def readout_key(rows):
+    """The rows as they look: a percentage to one decimal and the reset as the
+    words it is drawn with, so the readout is redrawn only when that changes."""
+    return tuple((k, round(pct, 1), human_delta(r), e, st) for k, pct, r, e, st in rows)
+
+
 class TaskbarWidget(object):
     """The always-visible readout, drawn as part of the taskbar.
 
@@ -49,6 +82,8 @@ class TaskbarWidget(object):
     _atom = None
     _proc = None                      # one WNDPROC for the class, kept alive here
     _windows = {}                     # hwnd -> instance, so the proc can dispatch
+    light = None                      # None: follow Windows; True/False: drawn for that theme
+    veil = True                       # False: no alpha-1 veil (the embedder lays its own)
 
     def __init__(self, app):
         self.app = app
@@ -301,11 +336,17 @@ class TaskbarWidget(object):
             user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
 
     # -- drawing -----------------------------------------------------------
+    def _is_light(self):
+        """The theme to draw for: Windows' own, unless one was set."""
+        if self.light is None:
+            return windows_uses_light_theme()
+        return bool(self.light)
+
     def _colors(self):
         """No background is painted, so these only have to stay legible on the
         real taskbar - which means following the Windows theme."""
         c = self.cfg()
-        light = windows_uses_light_theme()
+        light = self._is_light()
         fg = c.get("text_color", "auto")
         muted = c.get("muted_color", "auto")
         if fg == "auto":
@@ -318,31 +359,19 @@ class TaskbarWidget(object):
     def refresh(self, sources):
         if self.geometry is None:
             return
-        c = self.cfg()
-        rows = []
-        for src in sources:
-            usage = src.usage
-            limit = usage.by_key(src.metric())
-            pct = float(limit["percent"]) if limit else 0.0
-            reset = parse_reset(limit["resets_at"]) if limit else None
-            # Keep showing the last known figures; the flyout explains the
-            # trouble. A metric the API never returns would otherwise read as a
-            # confident 0%.
-            error = None if limit else (short_error(usage.error) or "no data")
-            # Numbers that stopped being refreshed deserve to be trusted less:
-            # dim them rather than pretend they are live. Dimming is about age,
-            # not about whether the last poll failed - a figure from a minute
-            # ago is still worth showing at full strength.
-            age = usage.age_seconds()
-            stale = age is None or age > max(600.0, 2.0 * src.poll_interval() + 60.0)
-            rows.append((src.key, pct, reset, error, stale))
-        event = (any(live_events(src.usage) for src in sources)
-                 and bool(c.get("show_events", True)))
-        state = (tuple((k, round(pct, 1), human_delta(r), e, st) for k, pct, r, e, st in rows),
-                 event, self.geometry, windows_uses_light_theme())
+        rows, event = readout_rows(sources, self.cfg())
+        state = (readout_key(rows), event, self.geometry, windows_uses_light_theme())
         if state == self._last_key:
             return
         _, _, w, h = self.geometry
+        image = self.compose(w, h, rows, event)
+        self._image = image
+        if self._blit(image):
+            self._last_key = state
+
+    def compose(self, w, h, rows, event):
+        """The readout for `rows` (see readout_rows), w x h pixels."""
+        c = self.cfg()
         sparkle = hex_to_rgba(c.get("event_color", "#F59E0B"))
         if len(rows) == 1:
             _, pct, reset, error, stale = rows[0]
@@ -355,9 +384,7 @@ class TaskbarWidget(object):
             image = self._render_rows(w, h, rows, event)
             if event:
                 draw_sparkle(image, w, h, sparkle)
-        self._image = image
-        if self._blit(image):
-            self._last_key = state
+        return image
 
     # How each provider's row is told apart when there are several.
     MARKS = {"claude": ("spark", "#D97757"), "ollama": ("ring", None)}
@@ -520,14 +547,17 @@ class TaskbarWidget(object):
 
         return self._finish(img, w, h)
 
-    @staticmethod
-    def _finish(img, w, h):
+    def _finish(self, img, w, h):
         """Downsample, then float the whole rectangle one step above fully
         transparent: UpdateLayeredWindow hit-tests on alpha, and a click has to
         land anywhere on the widget, not only on a letter. The veil takes the
-        theme's own colour so that even those 0.4% are invisible."""
+        theme's own colour so that even those 0.4% are invisible. An app that
+        draws the readout into a bigger window of its own veils that whole
+        window instead (`veil` False), and gets the plain downsample."""
         small = img.resize((w, h), Image.LANCZOS)
-        veil = (255, 255, 255, 1) if windows_uses_light_theme() else (0, 0, 0, 1)
+        if not self.veil:
+            return small
+        veil = (255, 255, 255, 1) if self._is_light() else (0, 0, 0, 1)
         base = Image.new("RGBA", (w, h), veil)
         base.alpha_composite(small)
         return base

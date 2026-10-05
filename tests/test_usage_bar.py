@@ -1319,7 +1319,8 @@ def test_fetch_worker():
     check("once it lands: who wrote it, nothing in flight, no error",
           raw.get("pid") == os.getpid() and raw.get("in_flight") is False
           and raw.get("error") is None and raw.get("status") is None
-          and abs(raw.get("updated_at", 0) - time.time()) < 60, some(raw, "pid", "in_flight", "error"))
+          and abs(raw.get("updated_at", 0) - time.time()) < 60,
+          some(raw, "pid", "in_flight", "error"))
     r = app.Usage()
     r.error, r.status = RL, 429
     h.claude._pending = r
@@ -1327,13 +1328,153 @@ def test_fetch_worker():
     raw = read_poll_state(h.claude)
     check("and how the last poll went, for whoever follows the file",
           raw.get("error") == RL and raw.get("status") == 429
-          and raw.get("retry_at") == h.claude.retry_at > time.time(), some(raw, "error", "status"))
+          and raw.get("retry_at") == h.claude.retry_at > time.time(),
+          some(raw, "error", "status"))
+
+
+def limit(pct, resets_at=None, key="session", label="Session (5h)"):
+    return {"key": key, "label": label, "percent": float(pct), "resets_at": resets_at,
+            "severity": "normal", "group": key}
+
+
+READOUT_STATES = ("one row", "two rows", "error", "spent", "stale", "event")
+
+
+def readout_sources(state):
+    """Real provider sources showing one of the readout's states. The reset is
+    days away, so its words ("3d 0h") cannot change between two drawings."""
+    h = Harness(providers=("claude", "ollama") if state == "two rows" else ("claude",))
+    later = (datetime.now().astimezone() + timedelta(days=3, minutes=30)).isoformat()
+    for src in h.active():
+        src.usage.limits = [limit(41 if src.key == "claude" else 72, later)]
+        src.usage.updated = datetime.now()
+    usage = h.claude.usage
+    if state == "error":
+        usage.limits, usage.error = [], "Offline"
+    elif state == "spent":
+        usage.limits = [limit(100, later)]
+    elif state == "stale":
+        usage.updated = datetime.now() - timedelta(minutes=20)
+    elif state == "event":
+        usage.events = [{"id": "g1", "label": "Free limit reset", "ends_at": None}]
+    return h.active()
+
+
+def painter(cfg, light, veil=True):
+    """A TaskbarWidget with no window, drawing for a theme of its own choosing."""
+    p = object.__new__(app.TaskbarWidget)
+    p.app = types.SimpleNamespace(cfg=cfg)
+    p.light, p.veil = light, veil
+    return p
+
+
+def through_refresh(sources, cfg, light, w=128, h=38):
+    """What TaskbarWidget.refresh hands to _blit, with Windows in `light` theme."""
+    stub = object.__new__(app.TaskbarWidget)
+    stub.app = types.SimpleNamespace(cfg=cfg)
+    stub.geometry, stub._last_key, stub.blitted = (0, 0, w, h), None, []
+    stub._blit = lambda image: stub.blitted.append(image) or True
+    real = app.windows_uses_light_theme
+    app.windows_uses_light_theme = lambda: light
+    try:
+        stub.refresh(sources)
+    finally:
+        app.windows_uses_light_theme = real
+    return stub
+
+
+def same(a, b):
+    return a.size == b.size and a.tobytes() == b.tobytes()
+
+
+def test_readout():
+    print("the readout drawn from plain data is the readout refresh draws")
+    cfg = copy.deepcopy(app.DEFAULT_CONFIG)
+    drawn = {}
+    for state in READOUT_STATES:
+        sources = readout_sources(state)
+        rows, event = app.readout_rows(sources, cfg["taskbar_widget"])
+        results = []
+        for light in (True, False):
+            stub = through_refresh(sources, cfg, light)
+            image = painter(cfg, light).compose(128, 38, rows, event)
+            drawn[state, light] = image
+            results.append(len(stub.blitted) == 1 and same(stub.blitted[0], image))
+        check("%s, light and dark: pixel for pixel" % state, results == [True, True],
+              repr(results))
+    check("and the two themes really are drawn differently",
+          not same(drawn["one row", True], drawn["one row", False]))
+    asked = []
+    real = app.windows_uses_light_theme
+    app.windows_uses_light_theme = lambda: asked.append(1) or True
+    try:
+        rows, event = app.readout_rows(readout_sources("two rows"), cfg["taskbar_widget"])
+        painter(cfg, False).compose(128, 38, rows, event)
+    finally:
+        app.windows_uses_light_theme = real
+    check("a theme that was set is drawn without asking Windows", asked == [])
+
+    print("the veil, and the sizes asked for")
+    check("with the veil every pixel is at least alpha 1, so clicks land anywhere",
+          all(image.getchannel("A").getextrema()[0] >= 1 for image in drawn.values()))
+    rows, event = app.readout_rows(readout_sources("one row"), cfg["taskbar_widget"])
+    bare = painter(cfg, True, veil=False).compose(128, 38, rows, event)
+    check("without it the corners are fully transparent",
+          bare.getpixel((0, 0))[3] == 0 and bare.getpixel((127, 37))[3] == 0)
+    sizes = []
+    for state in ("one row", "two rows", "error"):
+        rows, event = app.readout_rows(readout_sources(state), cfg["taskbar_widget"])
+        for w, h in ((128, 38), (152, 38), (190, 48)):
+            for veil in (True, False):
+                sizes.append(painter(cfg, True, veil).compose(w, h, rows, event).size == (w, h))
+    check("exactly 128x38, 152x38 and 190x48, veiled or not", all(sizes),
+          "%d of %d" % (sum(sizes), len(sizes)))
+
+    print("dimming old numbers")
+    sources = readout_sources("one row")
+    stale = []
+    for age in (599, 601):
+        sources[0].usage.updated = datetime.now() - timedelta(seconds=age)
+        stale.append(app.readout_rows(sources, cfg["taskbar_widget"])[0][0][4])
+    check("at a 120 s pace the numbers dim between 599 and 601 s old",
+          sources[0].poll_interval() == 120 and stale == [False, True], repr(stale))
+
+    print("what refresh remembers")
+    sources = readout_sources("one row")
+    stub = through_refresh(sources, cfg, True)
+    rows, event = app.readout_rows(sources, cfg["taskbar_widget"])
+    check("its cache key starts with readout_key(rows), then the event flag",
+          stub._last_key[:2] == (app.readout_key(rows), event), repr(stub._last_key[:2]))
+    real = app.windows_uses_light_theme
+    app.windows_uses_light_theme = lambda: True
+    try:
+        stub.refresh(sources)
+    finally:
+        app.windows_uses_light_theme = real
+    check("so nothing new is drawn while that stays the same", len(stub.blitted) == 1)
+
+    print("make_preview.py's way in")
+    import make_preview
+    saved = widget.windows_uses_light_theme
+    try:
+        preview = make_preview.load_app()
+        later = datetime.now().astimezone() + timedelta(days=3, minutes=30)
+        results = []
+        for light in (True, False):
+            obj = make_preview.widget(preview, cfg, light)
+            panel = preview.TaskbarWidget._render(obj, 141, 44, 72, later, None)
+            results.append(same(panel, painter(cfg, light)._render(141, 44, 72, later, None)))
+    finally:
+        widget.windows_uses_light_theme = saved
+    check("TaskbarWidget._render on a bare instance still draws, as before",
+          results == [True, True], repr(results))
 
 
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
                  test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama,
-                 test_window_procedures, test_rename, test_state_files, test_fetch_worker):
+                 test_window_procedures, test_rename, test_state_files, test_fetch_worker,
+                 test_readout):
         test()
     print()
     if FAILURES:
