@@ -1137,10 +1137,102 @@ def test_rename():
             setattr(app, k, v)
 
 
+def leftover_tmp(folder):
+    return [name for name in os.listdir(folder) if name.endswith(".tmp")]
+
+
+def test_state_files():
+    print("the state files are replaced whole, with the bytes they always had")
+    d = tempfile.mkdtemp()
+    u = app.Usage()
+    u.limits = [{"key": "session", "label": "Session (5h)", "percent": 41.0,
+                 "resets_at": stamp(S1), "severity": "normal", "group": "session"}]
+    u.updated = datetime.now()
+    u.events, u.events_checked = [], 1234.5
+    cache = os.path.join(d, ".usage_cache.json")
+    app.save_usage_cache(u, cache)
+    blob = {"limits": u.limits, "extra": None, "spend": None, "breakdown": [], "buckets": [],
+            "events": [], "events_checked": 1234.5, "updated": u.updated.isoformat()}
+    old = os.path.join(d, "as-before.json")
+    with open(old, "w", encoding="utf-8") as fh:      # how every state file used to be saved
+        json.dump(blob, fh)
+    with open(cache, "rb") as fh, open(old, "rb") as before:
+        got, want = fh.read(), before.read()
+    check("the usage cache is byte for byte what json.dump wrote before",
+          got == want == json.dumps(blob).encode("utf-8"))
+
+    notify = os.path.join(d, ".notify_state.json")
+    state = {"session": ("2026-09-23T12:10", 80.0), "grant:abc": ("", 1)}
+    app.save_notify_state(notify, state)
+    with open(notify, "rb") as fh:
+        got = fh.read()
+    check("so is the notification state",
+          got == json.dumps({k: [v[0], v[1]] for k, v in state.items()}).encode("utf-8"))
+    check("which reads back as it was saved", app.load_notify_state(notify) == state,
+          repr(app.load_notify_state(notify)))
+
+    poll = os.path.join(d, ".poll_state.json")
+    five = {"pace": 150.0, "pace_at": 10.0, "last_request": 20.0, "retry_at": 0.0, "backoff": 0.0}
+    app.save_poll_state(poll, dict(five))
+    with open(poll, "rb") as fh:
+        got = fh.read()
+    check("and the poll state", got == json.dumps(five).encode("utf-8"))
+    app.save_poll_state(poll, dict(five, next_poll_at=99.0, in_flight=True, error="Offline",
+                                   status=429, pid=4242, updated_at=30.0))
+    check("a v2.0.1 reading the newer poll state takes only the five numbers it knows",
+          app.load_poll_state(poll) == five, repr(app.load_poll_state(poll)))
+    check("and indent and the like still reach json.dumps",
+          app.write_json_atomic(old, {"a": [1]}, indent=2)
+          and open(old, encoding="utf-8").read() == json.dumps({"a": [1]}, indent=2))
+    check("no temporary file is left behind", leftover_tmp(d) == [], repr(leftover_tmp(d)))
+
+    print("a reader holding the file open")
+    probe = os.path.join(d, "probe.tmp")
+    with open(cache, "r", encoding="utf-8") as reader:
+        reader.read(10)
+        with open(probe, "w") as fh:
+            fh.write("{}")
+        try:
+            os.replace(probe, cache)
+            refused = False
+        except OSError:
+            refused = True
+        os.remove(probe)
+        saved = app.write_json_atomic(cache, {"limits": []})
+    with open(cache, encoding="utf-8") as fh:
+        text = fh.read()
+    check("Windows does refuse a replace while the file is open (what the fallback is for)",
+          refused)
+    check("the save still lands - written in place, as it always was",
+          saved and text == '{"limits": []}', text[:60])
+    check("and the temporary file is gone anyway", leftover_tmp(d) == [], repr(leftover_tmp(d)))
+
+    print("nowhere to write")
+    missing = os.path.join(d, "no such folder", "state.json")
+    try:
+        results = [app.write_json_atomic(missing, {"a": 1})]
+        app.save_usage_cache(u, missing)
+        app.save_notify_state(missing, state)
+        app.save_poll_state(missing, five)
+        raised = None
+    except Exception as exc:
+        results, raised = [], exc
+    check("a missing folder is a False, not an exception", results == [False] and raised is None,
+          repr(raised))
+    before = open(poll, "rb").read()
+    check("nor is anything unserialisable, and the old file stays whole",
+          app.write_json_atomic(poll, {"bad": object()}) is False
+          and open(poll, "rb").read() == before)
+
+    with open(os.path.join(os.path.dirname(HERE), ".gitignore"), encoding="utf-8") as fh:
+        ignored = [line.strip() for line in fh]
+    check("git ignores a temporary file a crash leaves behind", "*.tmp" in ignored)
+
+
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
                  test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama,
-                 test_window_procedures, test_rename):
+                 test_window_procedures, test_rename, test_state_files):
         test()
     print()
     if FAILURES:

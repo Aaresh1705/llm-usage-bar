@@ -9,7 +9,7 @@ import time
 
 from . import paths
 from .usage import Usage, limit_identity, load_usage_cache, save_usage_cache
-from .util import log
+from .util import log, write_json_atomic
 
 
 # Pacing. The usage endpoint sustains about one request per 100 seconds - at
@@ -35,11 +35,7 @@ def load_poll_state(path):
 
 
 def save_poll_state(path, state):
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(state, fh)
-    except Exception:
-        pass
+    write_json_atomic(path, state)
 
 
 # ---------------------------------------------------------------------------

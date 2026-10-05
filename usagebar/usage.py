@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from . import paths
-from .util import parse_reset
+from .util import parse_reset, write_json_atomic
 
 
 class Usage(object):
@@ -48,12 +48,12 @@ class Usage(object):
 
 def save_usage_cache(usage, path=None):
     try:
-        with open(path or paths.USAGE_CACHE, "w", encoding="utf-8") as fh:
-            json.dump({"limits": usage.limits, "extra": usage.extra, "spend": usage.spend,
-                       "breakdown": usage.breakdown, "buckets": usage.buckets,
-                       "events": getattr(usage, "events", None),
-                       "events_checked": getattr(usage, "events_checked", 0),
-                       "updated": usage.updated.isoformat() if usage.updated else None}, fh)
+        write_json_atomic(path or paths.USAGE_CACHE, {
+            "limits": usage.limits, "extra": usage.extra, "spend": usage.spend,
+            "breakdown": usage.breakdown, "buckets": usage.buckets,
+            "events": getattr(usage, "events", None),
+            "events_checked": getattr(usage, "events_checked", 0),
+            "updated": usage.updated.isoformat() if usage.updated else None})
     except Exception:
         pass
 
@@ -139,8 +139,7 @@ def load_notify_state(path):
 
 def save_notify_state(path, state):
     try:
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump({k: [v[0], v[1]] for k, v in state.items()}, fh)
+        write_json_atomic(path, {k: [v[0], v[1]] for k, v in state.items()})
     except Exception:
         pass
 
