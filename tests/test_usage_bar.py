@@ -8,11 +8,16 @@ instant comes back with different microseconds on every request, e.g.
 "2026-09-23T12:10:00.165535+00:00" then "2026-09-23T12:10:00.134418+00:00".
 """
 
+import ast
 import base64
 import copy
+import ctypes
+import ctypes.wintypes as wt
+import inspect
 import itertools
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -26,8 +31,8 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 from usagebar import deps  # noqa: E402 - loads requests and Pillow
 import usagebar  # noqa: E402
-from usagebar import (app as _app, config, flyout, paths, render, source, tkui,  # noqa: E402
-                      toast, usage, util, widget, win32)
+from usagebar import (app as _app, config, embed, flyout, paths, render, source,  # noqa: E402
+                      tkui, toast, usage, util, widget, win32)
 from usagebar import providers  # noqa: E402
 from usagebar.providers import claude, ollama  # noqa: E402
 
@@ -58,7 +63,7 @@ class Modules(object):
 
 
 app = Modules([paths, util, deps, config, usage, source, claude, ollama, providers, render,
-               win32, tkui, widget, flyout, toast, _app, usagebar])
+               win32, tkui, widget, flyout, toast, _app, usagebar, embed])
 
 # Everything the app would write - its log, the usage cache, the notification
 # state, the config - goes to a scratch directory. Without this the tests wrote
@@ -1399,9 +1404,11 @@ def test_readout():
             stub = through_refresh(sources, cfg, light)
             image = painter(cfg, light).compose(128, 38, rows, event)
             drawn[state, light] = image
-            results.append(len(stub.blitted) == 1 and same(stub.blitted[0], image))
-        check("%s, light and dark: pixel for pixel" % state, results == [True, True],
-              repr(results))
+            embedded = embed.render_readout(128, 38, rows, event, cfg, light, veil=True)
+            results.append(len(stub.blitted) == 1 and same(stub.blitted[0], image)
+                           and same(image, embedded))
+        check("%s, light and dark: refresh, compose and embed.render_readout agree" % state,
+              results == [True, True], repr(results))
     check("and the two themes really are drawn differently",
           not same(drawn["one row", True], drawn["one row", False]))
     asked = []
@@ -1413,14 +1420,17 @@ def test_readout():
     finally:
         app.windows_uses_light_theme = real
     check("a theme that was set is drawn without asking Windows", asked == [])
+    check("and no rows at all draw nothing, rather than fail",
+          embed.render_readout(152, 38, [], False, cfg, True).getbbox() is None)
 
     print("the veil, and the sizes asked for")
     check("with the veil every pixel is at least alpha 1, so clicks land anywhere",
           all(image.getchannel("A").getextrema()[0] >= 1 for image in drawn.values()))
     rows, event = app.readout_rows(readout_sources("one row"), cfg["taskbar_widget"])
-    bare = painter(cfg, True, veil=False).compose(128, 38, rows, event)
-    check("without it the corners are fully transparent",
-          bare.getpixel((0, 0))[3] == 0 and bare.getpixel((127, 37))[3] == 0)
+    bare = embed.render_readout(128, 38, rows, event, cfg, True)
+    check("without it (render_readout's default) the corners are fully transparent",
+          bare.getpixel((0, 0))[3] == 0 and bare.getpixel((127, 37))[3] == 0
+          and same(bare, painter(cfg, True, veil=False).compose(128, 38, rows, event)))
     sizes = []
     for state in ("one row", "two rows", "error"):
         rows, event = app.readout_rows(readout_sources(state), cfg["taskbar_widget"])
@@ -1470,11 +1480,504 @@ def test_readout():
           results == [True, True], repr(results))
 
 
+# -- usagebar.embed ---------------------------------------------------------
+
+PATH_NAMES = sorted(k for k, v in vars(paths).items() if k.isupper() and isinstance(v, str))
+FEED_CONFIG = {"notifications": {"enabled": True, "at": [80, 95, 100], "metrics": ["session"]},
+               "providers": {"claude": {"enabled": True}, "ollama": {"enabled": False}}}
+STANDALONE = embed.Standalone(pid=4242, hwnd=0x1234, window_class="LLMUsageBarWnd",
+                              overlay_hwnd=0x99, overlay_visible=True,
+                              overlay_rect=(8, 1397, 136, 1435))
+
+
+def usage_at(pct, age=0):
+    u = app.Usage()
+    u.limits = [limit(pct, stamp(S1))]
+    u.updated = datetime.now() - timedelta(seconds=age)
+    return u
+
+
+def feed_folder(cache_pct=None, cache_age=0, poll=None):
+    """A data folder of its own, set up as a host sets one up with
+    embed.configure, holding what a standalone would have left there."""
+    folder = embed.configure(tempfile.mkdtemp(prefix="feed-"),
+                             log_path=os.path.join(_SANDBOX, "llm_usage_bar.log"))
+    with open(paths.CONFIG_PATH, "w", encoding="utf-8") as fh:
+        json.dump(FEED_CONFIG, fh)
+    if cache_pct is not None:
+        app.save_usage_cache(usage_at(cache_pct, cache_age), paths.USAGE_CACHE)
+    if poll is not None:
+        app.save_poll_state(paths.POLL_STATE, poll)
+    return folder
+
+
+class FakeNetwork(object):
+    """Every provider's fetch() while it is in use: records each request and
+    answers `pct` - once `gate` opens, if there is one."""
+
+    def __init__(self, pct=20.0):
+        self.pct, self.calls, self.gate, self.saved = pct, [], None, {}
+
+    def __enter__(self):
+        net = self
+
+        def fetch(src, events):
+            net.calls.append(src.key)
+            if net.gate is not None:
+                net.gate.wait(5)
+            return usage_at(net.pct)
+
+        for cls in providers.SOURCES:
+            self.saved[cls] = cls.__dict__["fetch"]
+            cls.fetch = fetch
+        return self
+
+    def __exit__(self, *exc):
+        for cls, fetch in self.saved.items():
+            cls.fetch = fetch
+
+
+class Clock(object):
+    """The feed's clock, moved by hand; with sources_too() the sources' too."""
+
+    def __init__(self):
+        self.t = time.time()
+
+    def __call__(self):
+        return self.t
+
+    def sources_too(self):
+        clock = self
+
+        class Patch(object):
+            def __enter__(self):
+                self.real = app.time
+                app.time = types.SimpleNamespace(time=clock)
+
+            def __exit__(self, *exc):
+                app.time = self.real
+        return Patch()
+
+
+class Probe(object):
+    """An injected find_standalone: its answers in turn, the last one for good."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+
+    def __call__(self):
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+def make_feed(probe, clock, grace=15.0, notify=None, **kw):
+    """A UsageFeed whose notifications and posted messages are recorded -
+    nothing it does can reach a real standalone."""
+    notes, posted = [], []
+    feed = embed.UsageFeed(notify=notify or (lambda title, body: notes.append(title) or True),
+                           probe=probe, poster=lambda *msg: posted.append(msg) or True,
+                           clock=clock, startup_grace=grace, **kw)
+    return feed, notes, posted
+
+
+def run(feed, clock, seconds):
+    """Tick once a second for `seconds`, as the host's timer does."""
+    for _ in range(int(seconds)):
+        clock.t += 1.0
+        feed.tick()
+
+
+def shown(feed):
+    return feed.sources()[0].usage.percent("session")
+
+
+def own_window(class_name):
+    """A hidden top-level window of this process, standing in for a standalone's."""
+    proc = win32.WNDPROC(lambda h, m, w, l: win32.user32.DefWindowProcW(h, m, w, l))
+    wc = win32.WNDCLASS()
+    wc.lpfnWndProc = proc
+    wc.hInstance = win32.kernel32.GetModuleHandleW(None)
+    wc.lpszClassName = class_name
+    win32.user32.RegisterClassW(ctypes.byref(wc))
+    hwnd = win32.user32.CreateWindowExW(0, class_name, "test", 0, 0, 0, 0, 0,
+                                        None, None, wc.hInstance, None)
+    return int(hwnd or 0), (proc, wc)          # the second keeps the callback alive
+
+
+def close_handle(handle):
+    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def test_embed():
+    saved = {name: getattr(paths, name) for name in PATH_NAMES}
+    try:
+        embed_contract()
+        embed_standalone()
+        embed_follower()
+        embed_leader()
+        embed_handover()
+        embed_starting_and_closing()
+    finally:
+        for name, value in saved.items():
+            setattr(paths, name, value)
+
+
+def embed_contract():
+    print("usagebar.embed: what a host relies on")
+    with open(embed.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    api = [ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign)
+           and any(getattr(t, "id", None) == "HOST_API" for t in node.targets)]
+    check("HOST_API is a literal (int, int), major 1, readable without importing",
+          len(api) == 1 and api[0] == embed.HOST_API and len(api[0]) == 2
+          and all(type(n) is int for n in api[0]) and api[0][0] == 1, repr(api))
+    check("COMMANDS are app.py's CMD_* numbers, the ones every version answers",
+          [embed.COMMANDS[k] for k in ("details", "refresh", "quit")]
+          == [app.CMD_DETAILS, app.CMD_REFRESH, app.CMD_QUIT] == [1, 2, 8]
+          and len(embed.COMMANDS) == 3)
+    with open(_app.__file__, encoding="utf-8") as fh:
+        classes = re.findall(r'lpszClassName = "(\w+)"', fh.read())
+    mutexes = [node.value for node in ast.walk(ast.parse(inspect.getsource(app.single_instance)))
+               if isinstance(node, ast.Constant) and isinstance(node.value, str)
+               and node.value.startswith("Local\\")]
+    check("the window, mutex and overlay names are the ones the standalone uses",
+          classes == [embed.STANDALONE_WINDOWS[0]] and tuple(mutexes) == embed.STANDALONE_MUTEXES
+          and embed.STANDALONE_OVERLAYS[0] == app.TaskbarWidget.CLASS_NAME,
+          repr((classes, mutexes)))
+
+    exempt = {"APP_DIR", "LOCAL", "FALLBACK_LOG"}
+    before = {name: getattr(paths, name) for name in PATH_NAMES}
+    folder = os.path.join(tempfile.mkdtemp(), "standalone")
+    host_log = os.path.join(_SANDBOX, "host.log")
+    got = embed.configure(folder, log_path=host_log)
+    moved = {name for name in PATH_NAMES if getattr(paths, name) != before[name]}
+    check("configure moves every path but APP_DIR, LOCAL and FALLBACK_LOG (a new one needs adding)",
+          moved == set(PATH_NAMES) - exempt, repr(sorted(set(PATH_NAMES) - exempt - moved)))
+    files = moved - {"DATA_DIR", "LOG_PATH"}
+    check("into that folder, now made, under the standalone's own names; the log where asked",
+          got == folder == paths.DATA_DIR and os.path.isdir(folder) and paths.LOG_PATH == host_log
+          and all(getattr(paths, n) == os.path.join(folder, os.path.basename(before[n]))
+                  for n in files))
+
+    print("what usage-bar code asks of its app")
+    feed_folder()
+    feed, _, _ = make_feed(Probe(STANDALONE), Clock())
+    names = set()
+    for module in (flyout, toast, source, claude, ollama):
+        with open(module.__file__, encoding="utf-8") as fh:
+            names |= set(re.findall(r"self\.app\.(\w+)", fh.read()))
+    missing = sorted(n for n in names if not hasattr(feed._app, n))
+    check("every self.app.<name> in flyout, toast and the sources is on embed's _App",
+          "panel_corner" in names and not missing, repr(missing))
+    borrowed = ("check_notifications", "_check_signed_out", "_grant_alerts", "_notify_limit",
+                "sync_sources", "active", "usage_page", "set_provider")
+    used = set()
+    for name in borrowed:
+        used |= set(re.findall(r"self\.(\w+)", inspect.getsource(getattr(app.TrayApp, name))))
+    missing = sorted(n for n in used if not hasattr(feed._app, n))
+    check("TrayApp's own methods are borrowed, and all they use is there",
+          all(getattr(embed._App, n) is getattr(app.TrayApp, n) for n in borrowed)
+          and not missing, repr(missing))
+    feed.close()
+
+
+def embed_standalone():
+    print("finding a standalone, never creating its mutex")
+    tag = "%d-%d" % (os.getpid(), int(time.time() * 1000))
+    name, unused = "Local\\LLMUsageBarTest-" + tag, "Local\\LLMUsageBarTest-unused-" + tag
+    class_name = "LLMUsageBarTestWnd-" + tag
+    nowhere = {"windows": ("LLMUsageBarTestNoWnd",), "overlays": ("LLMUsageBarTestNoOverlay",)}
+    check("no mutex, no standalone", embed.find_standalone(mutexes=[name], **nowhere) is None)
+    handle = win32.kernel32.CreateMutexW(None, False, name)
+    found = embed.find_standalone(mutexes=[name], **nowhere)
+    check("its mutex alone is a standalone starting up", found == embed.Standalone(0, 0, "", 0, False),
+          repr(found))
+    hwnd, keep = own_window(class_name)
+    found = embed.find_standalone(mutexes=[name], windows=(class_name,),
+                                  overlays=nowhere["overlays"])
+    check("with its window: the window, and the process it belongs to",
+          hwnd and found is not None and found.hwnd == hwnd and found.pid == os.getpid()
+          and found.window_class == class_name, repr(found))
+    close_handle(handle)
+    check("and gone once the mutex is",
+          embed.find_standalone(mutexes=[name], windows=(class_name,)) is None)
+    embed.find_standalone(mutexes=[unused])
+    embed.standalone_running(mutexes=[unused])
+    ctypes.set_last_error(0)
+    handle = win32.kernel32.CreateMutexW(None, False, unused)
+    error = ctypes.get_last_error()
+    close_handle(handle)
+    check("looking never creates one: it did not exist afterwards", handle and error != 183,
+          "last error %d" % error)
+
+    print("asking a standalone: posted, never sent")
+    posted = []
+    sent = embed.ask_standalone("refresh", windows=(class_name,),
+                                poster=lambda *msg: posted.append(msg) or True)
+    check("refresh is WM_COMMAND 2 to its window", sent and posted == [(hwnd, 0x111, 2, 0)],
+          repr(posted))
+    sent = embed.ask_standalone("quit", windows=nowhere["windows"],
+                                poster=lambda *msg: posted.append(msg) or True)
+    check("with no window there is nobody to ask", sent is False and len(posted) == 1)
+    sent = embed.ask_standalone("details", windows=(class_name,))
+    msg = wt.MSG()
+    got = win32.user32.PeekMessageW(ctypes.byref(msg), None, 0x111, 0x111, 1)
+    check("the real PostMessageW delivers it (to a window of this test's own)",
+          sent and got and msg.message == 0x111 and msg.wParam == 1)
+    win32.user32.DestroyWindow(hwnd)
+
+
+def embed_follower():
+    print("following a standalone, through two hours of due polls")
+    with FakeNetwork() as net:
+        feed_folder(cache_pct=50)
+        clock = Clock()
+        feed, notes, posted = make_feed(Probe(STANDALONE), clock,
+                                        flyout_overrides={"theme": "dark"})
+        role = feed.role
+        with clock.sources_too():
+            for src in feed.sources():
+                src.next_poll_at = clock.t              # due now, and every few minutes after
+            run(feed, clock, 2)
+            first = shown(feed)
+            app.save_usage_cache(usage_at(95), paths.USAGE_CACHE)    # the standalone polls
+            run(feed, clock, 1)
+            adopted = shown(feed)
+            with open(paths.USAGE_CACHE, "w", encoding="utf-8") as fh:
+                fh.write('{"limits": [{"key": "sess')            # v2.0.1, caught mid-write
+            run(feed, clock, 1)
+            kept = shown(feed)
+            app.save_usage_cache(usage_at(60), paths.USAGE_CACHE)
+            run(feed, clock, 1)
+            check("a follower from the first probe, showing the standalone's numbers",
+                  role == "follower" and first == 50.0, repr((role, first)))
+            check("a cache the standalone writes is taken in on the next tick", adopted == 95.0)
+            check("a half-written one keeps the old numbers, and is read again",
+                  kept == 95.0 and shown(feed) == 60.0, repr((kept, shown(feed))))
+            with open(paths.USAGE_CACHE, "w", encoding="utf-8") as fh:
+                fh.write("not json")
+            run(feed, clock, 3)
+            check("one that stays unreadable for 3 s means there is nothing to show",
+                  feed.sources()[0].usage.limits == [])
+            app.save_usage_cache(usage_at(95), paths.USAGE_CACHE)
+            run(feed, clock, 1)
+            asked = [feed.refresh(), feed.refresh()]
+            clock.t += 15
+            asked.append(feed.refresh())
+            check("Refresh asks the standalone - WM_COMMAND 2 to its window - at most every 15 s",
+                  asked == ["asked", "too_soon", "asked"] and posted == [(0x1234, 0x111, 2, 0)] * 2,
+                  repr((asked, posted)))
+            run(feed, clock, 2 * 3600)
+            for src in feed.sources():
+                src.start_fetch(manual=True)
+                src.next_poll_at = 0
+                src.maybe_poll()
+        check("two hours of due polls, and Refresh on the sources themselves: not one request",
+              net.calls == [], repr(net.calls))
+        check("and nothing announced at 95% - that is the standalone's to do", notes == [])
+        summary = feed.summary()
+        check("its summary and status line say who polls",
+              summary.role == "follower" and summary.standalone_pid == 4242
+              and summary.standalone_overlay and summary.max_pct == 95.0
+              and summary.max_label == "Session (5h)" and summary.next_poll_in is None
+              and feed.status_line() == "Following LLM Usage Bar (pid 4242)", repr(summary))
+        rows, event = feed.readout()
+        check("the readout is readout_rows of its sources, ready for render_readout",
+              rows == app.readout_rows(feed.sources(), feed.config()["taskbar_widget"])[0]
+              and feed.readout_key() == (app.readout_key(rows), event)
+              and embed.render_readout(152, 38, rows, event, feed.config(), True).size == (152, 38))
+
+        print("its config and flyout")
+        check("the host's flyout settings go over the usage bar's, and nowhere else",
+              feed.config()["flyout"]["theme"] == "dark" and feed.config()["flyout"]["width"] == 320
+              and app.DEFAULT_CONFIG["flyout"]["theme"] == "auto")
+        with open(paths.CONFIG_PATH, "w", encoding="utf-8") as fh:
+            json.dump(dict(FEED_CONFIG, providers={"claude": {"enabled": True},
+                                                  "ollama": {"enabled": True}}), fh)
+        stamp_ = time.time() + 5
+        os.utime(paths.CONFIG_PATH, (stamp_, stamp_))
+        run(feed, clock, 2)
+        ollama_src = feed.sources()[-1]
+        check("config.json is watched: a provider switched on there appears - and stays gated",
+              feed.providers() == [("claude", "Claude", True), ("ollama", "Ollama", True)]
+              and ollama_src.key == "ollama" and "_fetch" in vars(ollama_src)
+              and feed.config()["flyout"]["theme"] == "dark")
+
+        class FakeFlyout(object):
+            visible, shown = False, 0
+
+            def show(self, sources):
+                self.visible, self.shown = True, self.shown + 1
+
+            def hide(self):
+                self.visible = False
+
+        panel = FakeFlyout()
+        feed._app.flyout = panel
+        feed.toggle_flyout()
+        opened = panel.shown
+        panel.hide()                    # clicking the host's readout took its focus away...
+        feed._flyout_focus_out()        # ...as the <FocusOut> bound after its own hide notes
+        clock.t += 0.1
+        feed.toggle_flyout()            # ...and then that click arrives
+        swallowed = panel.shown
+        clock.t += 0.5
+        feed.toggle_flyout()
+        check("the click that closed the flyout by taking its focus does not reopen it",
+              (opened, swallowed, panel.shown) == (1, 1, 2), repr((opened, swallowed, panel.shown)))
+        feed._app.flyout = None
+        feed.close()
+
+
+def embed_leader():
+    print("leading: notifications as the standalone sends them")
+    with FakeNetwork() as net:
+        feed_folder(cache_pct=50)
+        clock = Clock()
+        answers, titles = [False], []
+
+        def notify(title, body):
+            titles.append(title)
+            return answers.pop(0) if answers else True
+
+        feed, _, _ = make_feed(Probe(None), clock, grace=0, notify=notify)
+        feed.set_locked(True)             # no timed polls in the middle of this
+        src = feed.sources()[0]
+        for pct in (80, 81, 82):
+            src._pending = usage_at(pct)
+            clock.t += 1
+            feed.tick()
+        check("with no standalone it leads",
+              feed.role == "leader" and feed.summary().role == "leader")
+        check("80% goes through notify; held back once it is tried again, then never repeated",
+              titles == ["Claude usage 80%", "Claude usage 81%"], repr(titles))
+        check("and what was announced is on disk for whoever polls next",
+              app.load_notify_state(paths.NOTIFY_STATE).get("session", (0, 0))[1] == 80.0)
+        locked = feed.status_line()
+        feed.set_locked(False)
+        check("its status line says it polls, and when next",
+              locked == "Polling here · paused while locked"
+              and re.match(r"Polling here · next in \d+[sm]$", feed.status_line())
+              and feed.summary().next_poll_in is not None, feed.status_line())
+        check("nothing was fetched while locked", net.calls == [], repr(net.calls))
+        feed.close()
+
+
+def embed_handover():
+    print("a standalone appearing while a request is out")
+    with FakeNetwork(pct=85) as net:
+        feed_folder(cache_pct=50)
+        clock = Clock()
+        probe = Probe(None)
+        feed, notes, _ = make_feed(probe, clock, grace=0)
+        feed.set_locked(True)
+        src = feed.sources()[0]
+        net.gate = threading.Event()
+        src.start_fetch(manual=True)
+        wait_for(lambda: net.calls == ["claude"])
+        probe.answers = [STANDALONE]
+        clock.t += 2
+        feed.tick()
+        role = feed.role
+        net.gate.set()
+        wait_for(lambda: src._pending is not None)
+        clock.t += 1
+        feed.tick()
+        cached = app.load_usage_cache(paths.USAGE_CACHE)
+        check("it follows at once, and the answer still lands - shown, and in the cache",
+              role == "follower" and shown(feed) == 85.0
+              and cached is not None and cached.percent("session") == 85.0)
+        check("unannounced: 85% is the standalone's to tell", notes == [])
+        r = app.Usage()
+        r.with_events, r.error, r.status = True, "Server error", 500
+        src._pending = r
+        clock.t += 1
+        feed.tick()
+        with clock.sources_too():
+            for each in feed.sources():
+                each.next_poll_at = 0
+            run(feed, clock, 600)
+        check("a refused event check's re-fetch, and every poll after, stay home",
+              net.calls == ["claude"] and not src._fetching, repr(net.calls))
+        feed.close()
+
+    print("the standalone going away")
+    with FakeNetwork(pct=80) as net:
+        now = time.time()
+        feed_folder(cache_pct=80, cache_age=60,
+                    poll={"pace": 0.0, "pace_at": 0.0, "last_request": now - 30,
+                          "retry_at": now + 600, "backoff": 120.0})
+        clock = Clock()
+        probe = Probe(STANDALONE)
+        feed, notes, _ = make_feed(probe, clock)
+        run(feed, clock, 2)
+        # Meanwhile the standalone announced the 80%, and wrote that down.
+        app.save_notify_state(paths.NOTIFY_STATE, {"session": (app.window_key(stamp(S1)), 80.0)})
+        probe.answers = [None]
+        roles = []
+        for _ in range(3):
+            clock.t += 2
+            feed.tick()
+            roles.append(feed.role)
+        check("it leads only after three probes in a row find none (6 s)",
+              roles == ["follower", "follower", "leader"], repr(roles))
+        src = feed.sources()[0]
+        check("its first poll waits out the rate limit on disk, 10 minutes off",
+              src.next_poll_at >= now + 600 and src.next_poll_at >= now - 30 + src.poll_min,
+              "in %.0f s" % (src.next_poll_at - now))
+        run(feed, clock, 10)
+        src._pending = usage_at(80)
+        clock.t += 1
+        feed.tick()
+        check("nothing goes out before then, and the 80% it announced is not announced again",
+              net.calls == [] and notes == [], repr((net.calls, notes)))
+        feed.close()
+
+
+def embed_starting_and_closing():
+    print("the first seconds after the host starts")
+    with FakeNetwork() as net:
+        feed_folder()                         # no numbers at all: a leader would ask at once
+        clock = Clock()
+        feed, _, _ = make_feed(Probe(None), clock, grace=15)
+        roles = []
+        with clock.sources_too():
+            for _ in range(14):
+                clock.t += 1
+                feed.tick()
+                roles.append(feed.role)
+            for src in feed.sources():
+                src.start_fetch(manual=True)
+            early = (list(net.calls), feed.refresh())
+            clock.t += 1
+            feed.tick()
+        check("for its 15 s grace it only reads: no request, even when asked for one",
+              set(roles) == {"starting"} and early == ([], "starting"), repr((roles[-1], early)))
+        check("then, with no standalone seen at all, it leads - and asks",
+              feed.role == "leader" and wait_for(lambda: net.calls == ["claude"]), repr(net.calls))
+        wait_for(lambda: feed.sources()[0]._pending is not None)
+        feed.close()
+
+    print("closing")
+    with FakeNetwork() as net:
+        feed_folder()
+        feed, _, _ = make_feed(Probe(None), Clock(), grace=0)
+        feed.set_locked(True)
+        kept = feed.sources()
+        feed.close()
+        for src in kept:
+            src.start_fetch(manual=True)
+            src.next_poll_at = 0
+            src.maybe_poll()
+        check("close() stops every request, from every route, and the feed with it",
+              net.calls == [] and feed.tick() is False and feed.refresh() == "closed"
+              and feed.sources() == [], repr(net.calls))
+
+
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
                  test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama,
                  test_window_procedures, test_rename, test_state_files, test_fetch_worker,
-                 test_readout):
+                 test_readout, test_embed):
         test()
     print()
     if FAILURES:

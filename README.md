@@ -519,12 +519,62 @@ still track the `thresholds` you configure.
 {"primary_metric": "max", "providers": {"ollama": {"metric": "max"}}}
 ```
 
+## Embedding (`usagebar.embed`)
+
+Another app can run the usage bar inside itself - Ultimate Widget shows it as
+one page of its own taskbar widget. `usagebar/embed.py` is the whole
+interface. The standalone never imports it, so it runs exactly as it does
+without it.
+
+```python
+from usagebar import embed
+
+embed.configure(data_dir, log_path=host_log)   # the standalone's folder, shared
+embed.attach_tk(root)                          # for the flyout and toasts
+feed = embed.UsageFeed(notify=show_toast, on_change=redraw, panel_corner="left",
+                       flyout_overrides={"theme": "dark"})
+
+# about once a second, on the UI thread:
+if feed.tick():
+    rows, event = feed.readout()
+    image = embed.render_readout(152, 38, rows, event, feed.config(), light, veil=False)
+```
+
+* **`HOST_API`** is a literal `(major, minor)`, now `(1, 0)`. A host reads it
+  from the file with `ast` before importing anything, and takes a copy whose
+  major is the one it was written for and whose minor is at least the one it
+  needs. The major goes up when something in `embed` stops working the old
+  way, the minor when something is added.
+* **One poller.** While a standalone runs - any version, found by its mutex -
+  the feed follows it: it reads the standalone's cache and poll state every
+  second, asks it to refresh (`WM_COMMAND 2`, at most every 15 s), and never
+  sends a request or a notification of its own. With none running it leads,
+  polling and notifying exactly as the standalone would. Both use the same
+  files, so the pace, a rate limit and what was already announced carry over
+  either way. For its first 15 s it only reads, which gives a standalone
+  started at the same logon time to take its mutex; it takes the lead only
+  after three probes 2 s apart find none.
+* **A standalone that is already running** is found with `find_standalone()`
+  (`OpenMutexW` and `FindWindowW` - it never creates the mutex and sends no
+  message) and told things with `ask_standalone("details" | "refresh" | "quit")`,
+  which posts `WM_COMMAND` 1, 2 or 8 to `LLMUsageBarWnd`. Every version since
+  1.0 answers those, and hosts rely on it: **never renumber `CMD_*` in `app.py`,
+  and never rename `LLMUsageBarWnd`, `LLMUsageOverlayWnd` or the mutexes, without
+  a major bump.** The tests check that `embed`'s copies match.
+* **The readout**: `render_readout` draws the taskbar readout pixel for pixel,
+  through `TaskbarWidget.compose`. The flyout is the real `Flyout`
+  (`feed.toggle_flyout()`); `embed.Toast` and `embed.FLUENT` are the toast and the
+  palette, for the host's own notifications and panels.
+* **The overlay window is not shared.** Ultimate Widget draws its own layered
+  child of the taskbar, with code adapted from `widget.py`'s window, blit and
+  placement code. A fix to any of those here should be ported there.
+
 ## Notes
 
 * Only one instance runs: a per-session named mutex, which a second copy waits
   on briefly before giving up - so a leftover lock can't stop the app from
   starting again, and the version from before the rename can't run beside it.
-* Every launch writes a `starting v2.0.1 (pid …)` line to `llm_usage_bar.log`, so
+* Every launch writes a `starting v2.1.0 (pid …)` line to `llm_usage_bar.log`, so
   "it didn't come back after a reboot" is answerable. A line means it started -
   compare its timestamp with `(Get-CimInstance Win32_OperatingSystem).LastBootUpTime`
   to see how long the shell took to get to it. No line at all means Windows never
@@ -553,14 +603,14 @@ still track the `thresholds` you configure.
 | File | |
 | --- | --- |
 | `llm_usage_bar.pyw` | Starts the app - what the startup task runs. |
-| `usagebar/` | The app. `app.py` (the main loop, menu, notifications), `source.py` (the provider base class: pacing, backoff, cache), `providers/` (one module per provider), `widget.py`, `flyout.py`, `toast.py`, `render.py`, `config.py` (the defaults), `usage.py`, `paths.py`, `win32.py`, `tkui.py`, `util.py`, `deps.py`. |
+| `usagebar/` | The app. `app.py` (the main loop, menu, notifications), `source.py` (the provider base class: pacing, backoff, cache), `providers/` (one module per provider), `widget.py`, `flyout.py`, `toast.py`, `render.py`, `config.py` (the defaults), `usage.py`, `paths.py`, `win32.py`, `tkui.py`, `util.py`, `deps.py`, and `embed.py` for apps that embed it. |
 | `claude_usage_bar.pyw` | The old name, kept so installs from before the rename keep starting. |
 | `config.json` | Your settings, hot-reloaded. Not tracked by git: it is written from the defaults on first run, so it survives updates. |
 | `install.ps1` | Install, update (`-Update`), uninstall (`-Uninstall`). Registers the logon task; `-UseStartupFolder` for a shortcut instead. |
 | `build.ps1` | Builds the standalone `dist\LLMUsageBar.exe`. |
 | `make_icon.py` | Draws `assets\LLMUsageBar.ico` for the exe and the shortcut. |
 | `make_preview.py` | Redraws `preview.png` with the widget's own renderer, so the picture cannot drift from the app. |
-| `tests/test_usage_bar.py` | Notifications, events, pacing, providers and the move from the old name, driven through the real code: `python tests/test_usage_bar.py`. It writes only into a temporary folder. |
+| `tests/test_usage_bar.py` | Notifications, events, pacing, providers, the state files, the readout, `embed` and the move from the old name, driven through the real code: `python tests/test_usage_bar.py`. It writes only into a temporary folder. |
 | `LICENSE` | MIT. |
 
 ## Licence
