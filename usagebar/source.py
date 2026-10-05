@@ -6,6 +6,7 @@ import json
 import os
 import threading
 import time
+import traceback
 
 from . import paths
 from .usage import Usage, limit_identity, load_usage_cache, save_usage_cache
@@ -201,13 +202,27 @@ class Source(object):
         self.last_request = time.time()
         # provisional - replaced by plan_next_poll when the answer lands
         self.next_poll_at = self.last_request + self.poll_interval()
+        # On disk before the request goes out, not only once it is answered:
+        # another copy starting meanwhile then waits poll_min after this one
+        # instead of asking on top of it.
+        self._save_poll_state()
 
         def worker():
-            result = self.fetch(events)
-            result.manual = manual
-            self._fetching = False          # before the result is visible, so
-            with self._lock:                # apply_pending can fetch again
-                self._pending = result
+            # A fetch that raised used to leave _fetching set for good, and
+            # maybe_poll never polled again. Now it is an ordinary failed poll.
+            result = None
+            try:
+                result = self.fetch(events)
+            except Exception:
+                log("%s: fetch failed: %s" % (self.name, traceback.format_exc()))
+            finally:
+                if result is None:
+                    result = Usage()
+                    result.error = "Fetch failed"
+                result.manual = manual
+                self._fetching = False          # before the result is visible, so
+                with self._lock:                # apply_pending can fetch again
+                    self._pending = result
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -237,9 +252,21 @@ class Source(object):
                 self._unchanged = self._unchanged + 1 if seen == self._last_seen else 0
                 self._last_seen = seen
             self.next_poll_at = now + self.poll_interval()
+        self._save_poll_state()
+
+    def _save_poll_state(self):
+        """The five numbers a restart needs, plus what another process
+        following this one wants to know: when the next poll is, whether a
+        request is out now, how the last one went, and who wrote it.
+        load_poll_state reads only the five, so older versions ignore the rest."""
+        error = self.usage.error
         save_poll_state(self.poll_path, {
             "pace": self.pace, "pace_at": self.pace_at, "last_request": self.last_request,
-            "retry_at": self.retry_at, "backoff": self.backoff})
+            "retry_at": self.retry_at, "backoff": self.backoff,
+            "next_poll_at": self.next_poll_at, "in_flight": bool(self._fetching),
+            "error": None if error is None else str(error),
+            "status": getattr(self.usage, "status", None),
+            "pid": os.getpid(), "updated_at": time.time()})
 
     def apply_pending(self):
         """Take in a finished poll; True when `usage` changed."""

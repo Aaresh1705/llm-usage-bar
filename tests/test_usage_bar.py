@@ -16,6 +16,7 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import time
 import types
 from datetime import datetime, timedelta
@@ -1229,10 +1230,110 @@ def test_state_files():
     check("git ignores a temporary file a crash leaves behind", "*.tmp" in ignored)
 
 
+def wait_for(condition, seconds=5.0):
+    """For a fetch running on the source's own worker thread."""
+    deadline = time.time() + seconds
+    while not condition() and time.time() < deadline:
+        time.sleep(0.01)
+    return condition()
+
+
+def read_poll_state(src):
+    with open(src.poll_path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def some(raw, *keys):
+    return repr({k: raw.get(k) for k in keys})
+
+
+def test_fetch_worker():
+    print("a fetch that raises, on the real worker thread")
+    h = Harness()
+    h.set(session=(40, S1))
+    h.claude.usage.updated = datetime.now()
+    calls = []
+
+    def broken(events):
+        calls.append("broken")
+        raise RuntimeError("the provider fell over")
+
+    h.claude.fetch = broken
+    h.claude.start_fetch()
+    landed = wait_for(lambda: h.claude._pending is not None)
+    pending = h.claude._pending
+    check("still hands back a result, marked 'Fetch failed', with _fetching cleared",
+          landed and not h.claude._fetching and pending.error == "Fetch failed",
+          repr(pending and pending.error))
+    with open(app.LOG_PATH, encoding="utf-8") as fh:
+        logged = fh.read()
+    check("and the traceback is in the log", "RuntimeError: the provider fell over" in logged)
+    h.apply_pending()
+    check("the last good numbers stay up", h.claude.usage.percent("session") == 40.0
+          and h.claude.usage.error == "Fetch failed")
+    now = time.time()
+    check("the next timed poll is planned as after any failure",
+          now < h.claude.next_poll_at <= now + h.claude.poll_max, "%.0f s"
+          % (h.claude.next_poll_at - now))
+
+    def good(events):
+        calls.append("good")
+        r = app.Usage()
+        r.limits = [{"key": "session", "label": "Session (5h)", "percent": 45.0,
+                     "resets_at": stamp(S1), "severity": "normal", "group": "session"}]
+        r.updated = datetime.now()
+        return r
+
+    h.claude.fetch = good
+    h.claude.next_poll_at = time.time() - 1          # ...and once it is due, it happens
+    h.claude.maybe_poll()
+    wait_for(lambda: h.claude._pending is not None)
+    h.apply_pending()
+    check("polling carries on: the next one goes out and lands",
+          calls == ["broken", "good"] and h.claude.usage.percent("session") == 45.0, repr(calls))
+
+    print("the poll state is on disk as soon as a request goes out")
+    started, release = threading.Event(), threading.Event()
+
+    def slow(events):
+        started.set()
+        release.wait(5)
+        return good(events)
+
+    h.claude.fetch = slow
+    h.claude.next_poll_at = time.time() - 1
+    h.claude.maybe_poll()
+    started.wait(5)
+    raw = read_poll_state(h.claude)
+    check("last_request is saved while the request is still out",
+          raw.get("last_request") == h.claude.last_request and raw.get("in_flight") is True
+          and raw.get("next_poll_at") == h.claude.next_poll_at, some(raw, "in_flight", "next_poll_at"))
+    second = claude.ClaudeSource(h)             # another copy starting right now
+    check("so a copy starting meanwhile waits poll_min after it",
+          second.next_poll_at >= h.claude.last_request + h.claude.poll_min,
+          "%.0f s" % (second.next_poll_at - h.claude.last_request))
+    release.set()
+    wait_for(lambda: h.claude._pending is not None)
+    h.apply_pending()
+    raw = read_poll_state(h.claude)
+    check("once it lands: who wrote it, nothing in flight, no error",
+          raw.get("pid") == os.getpid() and raw.get("in_flight") is False
+          and raw.get("error") is None and raw.get("status") is None
+          and abs(raw.get("updated_at", 0) - time.time()) < 60, some(raw, "pid", "in_flight", "error"))
+    r = app.Usage()
+    r.error, r.status = RL, 429
+    h.claude._pending = r
+    h.apply_pending()
+    raw = read_poll_state(h.claude)
+    check("and how the last poll went, for whoever follows the file",
+          raw.get("error") == RL and raw.get("status") == 429
+          and raw.get("retry_at") == h.claude.retry_at > time.time(), some(raw, "error", "status"))
+
+
 def main():
     for test in (test_spam, test_coverage, test_delivery, test_events, test_parsing,
                  test_event_poll, test_pacing, test_a_day, test_flyout_key, test_ollama,
-                 test_window_procedures, test_rename, test_state_files):
+                 test_window_procedures, test_rename, test_state_files, test_fetch_worker):
         test()
     print()
     if FAILURES:
