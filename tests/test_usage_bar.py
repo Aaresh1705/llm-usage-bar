@@ -1213,6 +1213,41 @@ def test_state_files():
           saved and text == '{"limits": []}', text[:60])
     check("and the temporary file is gone anyway", leftover_tmp(d) == [], repr(leftover_tmp(d)))
 
+    print("no room for the temporary file")
+    real_open = open
+
+    class FullDisk(object):
+        """A file that opens, then cannot take a byte."""
+
+        def __init__(self, name, *args, **kw):
+            self.fh = real_open(name, *args, **kw)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+
+        def write(self, text):
+            raise OSError(28, "There is not enough space on the disk")
+
+    def too_long(name, *args, **kw):
+        raise OSError(206, "The filename or extension is too long", name)
+
+    for why, tmp_open in (("cannot be made (past MAX_PATH)", too_long),
+                          ("cannot be written (a full disk)", FullDisk)):
+        util.open = lambda name, *a, **kw: (tmp_open if str(name).endswith(".tmp")
+                                            else real_open)(name, *a, **kw)
+        try:
+            saved = app.write_json_atomic(poll, {"pace": 2.0, "why": why})
+        finally:
+            del util.open                   # util looks open up in its own module first
+        with open(poll, encoding="utf-8") as fh:
+            text = fh.read()
+        check("a temporary file that %s: the save still lands, in place as before" % why,
+              saved is True and json.loads(text) == {"pace": 2.0, "why": why}, text[:60])
+        check("and nothing of it is left behind", leftover_tmp(d) == [], repr(leftover_tmp(d)))
+
     print("nowhere to write")
     missing = os.path.join(d, "no such folder", "state.json")
     try:
@@ -1615,6 +1650,7 @@ def test_embed():
         embed_follower()
         embed_leader()
         embed_handover()
+        embed_looking_first()
         embed_starting_and_closing()
     finally:
         for name, value in saved.items():
@@ -1643,6 +1679,39 @@ def embed_contract():
           classes == [embed.STANDALONE_WINDOWS[0]] and tuple(mutexes) == embed.STANDALONE_MUTEXES
           and embed.STANDALONE_OVERLAYS[0] == app.TaskbarWidget.CLASS_NAME,
           repr((classes, mutexes)))
+    check("and 1.x's names after them: a standalone from before the rename is still found and asked",
+          embed.STANDALONE_WINDOWS[1:] == ("ClaudeUsageBarWnd",)
+          and embed.STANDALONE_OVERLAYS[1:] == ("ClaudeUsageOverlayWnd",)
+          and embed.STANDALONE_MUTEXES[1:] == ("Local\\ClaudeUsageBarMutex",),
+          repr((embed.STANDALONE_WINDOWS, embed.STANDALONE_OVERLAYS)))
+
+    # Python checks a class's annotations when it makes the class, so `int | None`
+    # there stops a module loading before 3.10 unless they are kept as text.
+    late = []
+    for folder in (os.path.dirname(usagebar.__file__), os.path.dirname(providers.__file__), HERE):
+        for name in sorted(os.listdir(folder)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(folder, name), encoding="utf-8") as fh:
+                text = fh.read()
+            try:
+                tree = ast.parse(text, feature_version=(3, 8))
+            except SyntaxError as exc:
+                late.append("%s: %s" % (name, exc))
+                continue
+            postponed = any(isinstance(node, ast.ImportFrom) and node.module == "__future__"
+                            and any(a.name == "annotations" for a in node.names)
+                            for node in tree.body)
+            notes = [n.annotation for n in ast.walk(tree) if isinstance(n, (ast.AnnAssign, ast.arg))]
+            notes += [n.returns for n in ast.walk(tree)
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            if not postponed and any(isinstance(part, ast.BinOp) and isinstance(part.op, ast.BitOr)
+                                     for note in notes if note is not None
+                                     for part in ast.walk(note)):
+                late.append("%s: X | Y annotations without from __future__ import annotations"
+                            % name)
+    check("the app, embed and these tests still load on Python 3.8 and 3.9, as v2.0.1 did",
+          not late, "; ".join(late))
 
     exempt = {"APP_DIR", "LOCAL", "FALLBACK_LOG"}
     before = {name: getattr(paths, name) for name in PATH_NAMES}
@@ -1930,6 +1999,92 @@ def embed_handover():
         feed.tick()
         check("nothing goes out before then, and the 80% it announced is not announced again",
               net.calls == [] and notes == [], repr((net.calls, notes)))
+        feed.close()
+
+    print("a standalone quitting with a request out (Take over, Close, a crash)")
+    waits = {}
+    for writer, extra in (("2.0", {}), ("2.1", {"in_flight": False, "pid": 4242})):
+        with FakeNetwork() as net:
+            now = time.time()
+            # Its last answer landed 150 s ago, so at the 120 s pace it was due
+            # and has asked - which 2.0 writes down only once the answer is in.
+            feed_folder(cache_pct=50, cache_age=150,
+                        poll=dict({"pace": 0.0, "pace_at": 0.0, "last_request": now - 150,
+                                   "retry_at": 0.0, "backoff": 0.0}, **extra))
+            clock = Clock()
+            probe = Probe(STANDALONE)
+            feed, _, _ = make_feed(probe, clock)
+            with clock.sources_too():
+                run(feed, clock, 2)
+                probe.answers = [None]
+                gone = clock.t
+                for _ in range(200):
+                    run(feed, clock, 1)
+                    if feed.role == "leader" and feed.sources()[0].last_request > gone:
+                        break
+            src = feed.sources()[0]
+            waits[writer] = (feed.role, src.last_request - gone, src.poll_min)
+            wait_for(lambda: src._pending is not None)
+            feed.close()
+    role, waited, poll_min = waits["2.0"]
+    check("after a 2.0 one, whose request may be out unrecorded, the new leader waits poll_min",
+          role == "leader" and poll_min <= waited <= poll_min + 10, repr(waits))
+    role, waited, _ = waits["2.1"]
+    check("a 2.1 one writes its requests down when they start: due on disk is due, at once",
+          role == "leader" and waited <= 10, repr(waits))
+
+
+def embed_looking_first():
+    print("a standalone starting between two of a leader's looks")
+    with FakeNetwork() as net:
+        feed_folder(cache_pct=50, cache_age=600)          # a poll is due
+        clock = Clock()
+        probe = Probe(None)
+        feed, _, _ = make_feed(probe, clock, grace=0)
+        with clock.sources_too():
+            src = feed.sources()[0]
+            src.next_poll_at = clock.t + 3600              # held back while the timers settle
+            run(feed, clock, 10)                            # at the 2 s pace the last look was now
+            probe.answers = [STANDALONE]                    # it takes its mutex...
+            src.next_poll_at = clock.t                      # ...and a poll falls due
+            run(feed, clock, 1)                             # the 5 s poll timer's tick, no look due
+            role = feed.role
+            run(feed, clock, 3)
+        check("a timed poll due in the second after it started is not sent: the leader looks first",
+              role == "follower" and net.calls == [], repr((role, net.calls)))
+        feed.close()
+
+    with FakeNetwork() as net:
+        feed_folder(cache_pct=50, cache_age=30)            # not due, but Refresh may ask
+        clock = Clock()
+        probe = Probe(None)
+        feed, _, posted = make_feed(probe, clock, grace=0)
+        run(feed, clock, 2)
+        probe.answers = [STANDALONE]
+        clock.t += 0.3                                      # no tick: a host menu held the thread
+        answer = feed.refresh()
+        check("Refresh right after it started asks it to, instead of asking on top of it",
+              answer == "asked" and feed.role == "follower" and net.calls == []
+              and posted == [(0x1234, 0x111, 2, 0)], repr((answer, feed.role, net.calls, posted)))
+        feed.close()
+
+    with FakeNetwork(pct=90) as net:
+        feed_folder(cache_pct=50, cache_age=600)
+        clock = Clock()
+        probe = Probe(None)
+        feed, notes, _ = make_feed(probe, clock, grace=0)
+        net.gate = threading.Event()
+        run(feed, clock, 1)                                 # due: the request goes out
+        sent = wait_for(lambda: net.calls == ["claude"])
+        run(feed, clock, 1)                                 # a look: none yet
+        probe.answers = [STANDALONE]                        # it starts, reading what was announced
+        src = feed.sources()[0]
+        net.gate.set()
+        wait_for(lambda: src._pending is not None)
+        run(feed, clock, 1)                                 # 90% lands; no look due at the 2 s pace
+        check("an answer landing after it started is shown, and left to it to announce",
+              sent and feed.role == "follower" and shown(feed) == 90.0 and notes == [],
+              repr((feed.role, shown(feed), notes)))
         feed.close()
 
 

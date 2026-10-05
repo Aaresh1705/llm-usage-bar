@@ -9,9 +9,10 @@ The contract is HOST_API. It is a literal, so a host can read it with `ast`
 from this file before importing anything, and pick a copy it understands: the
 major number changes when something here stops working the old way, the minor
 when something is added. What a host talks to in a standalone that is already
-running - the CMD_* numbers, the LLMUsageBarWnd window class, the mutex names -
-never changes without a major bump, because a host has to work with every
-version already out there.
+running - the CMD_* numbers (the same since 1.0), the window classes
+(LLMUsageBarWnd from 2.0, ClaudeUsageBarWnd before), the mutex names - never
+changes without a major bump, because a host has to work with every version
+already out there.
 
 One poller. The standalone always wins: while one runs (any version, found by
 its mutex), the feed follows it - it mirrors the standalone's cache and poll
@@ -24,6 +25,11 @@ Everything here runs on the host's UI thread, as the standalone's own code
 does: the only I/O is stat calls and small local reads and writes of the
 usage bar's own state files.
 """
+
+# The dataclasses below annotate with `X | None`, which Python evaluates when
+# the class is made and only 3.10 understands. Kept as text, this module and
+# the tests that import it still load on 3.8 and 3.9, as v2.0.1 did.
+from __future__ import annotations
 
 import copy
 import ctypes
@@ -53,6 +59,9 @@ FLUENT = tkui.FLUENT            # the Fluent palette, for a host's own panels
 Toast = toast.Toast             # Toast(owner): owner needs panel_corner() and toggle_flyout()
 Flyout = flyout.Flyout          # what UsageFeed.toggle_flyout opens
 
+# The 2.0+ names first, then 1.x's (before the rename), which a host must still
+# find: dropping them leaves a 1.x standalone found by its mutex alone, with no
+# window to ask.
 STANDALONE_MUTEXES = ("Local\\LLMUsageBarMutex", "Local\\ClaudeUsageBarMutex")
 STANDALONE_WINDOWS = ("LLMUsageBarWnd", "ClaudeUsageBarWnd")
 STANDALONE_OVERLAYS = ("LLMUsageOverlayWnd", "ClaudeUsageOverlayWnd")
@@ -337,11 +346,13 @@ class UsageFeed(object):
       refresh when told to (WM_COMMAND, at most every 15 s); never fetches and
       never notifies - the standalone does both.
 
-    A standalone found by a probe makes the feed a follower at once. It leads
-    again only after three probes in a row (6 s) find none, so a standalone
-    restarting does not hand the lead over; then it rebuilds its sources from
-    disk, so the standalone's last request, rate limit and announcements count.
-    mode="follow" never leads.
+    A standalone found by a probe makes the feed a follower at once. A leader
+    looks on every tick and again before a Refresh, so no request or
+    announcement goes out on a probe that a standalone started since has made
+    out of date. It leads again only after three probes in a row (6 s) find
+    none, so a standalone restarting does not hand the lead over; then it
+    rebuilds its sources from disk, so the standalone's last request, rate
+    limit and announcements count. mode="follow" never leads.
 
     tick() does all of it, on the host's UI thread, about once a second.
     """
@@ -371,6 +382,7 @@ class UsageFeed(object):
         self.standalone = None
         self._grace_until = now + float(startup_grace)
         self._negatives = 0
+        self._vanished_at = None
         self._closed = False
         self._dirty = False
         self._next_probe = self._next_mirror = self._next_poll = 0.0
@@ -481,7 +493,13 @@ class UsageFeed(object):
         if self._closed:
             return False
         now = self._clock() if now is None else now
-        if now >= self._next_probe:
+        # A leader looks every tick, not every PROBE_SECONDS: a standalone that
+        # took its mutex since the last look reads the poll and notify state
+        # on its way up, and a request or an announcement made here on an
+        # older look would be made by both. Looking in the same tick as the
+        # request - whose _fetch writes last_request at once - leaves it no
+        # gap; it costs two OpenMutexW calls a second.
+        if now >= self._next_probe or self.role == self.LEADER:
             self._look(now)
         if self.role == self.STARTING and now >= self._grace_until:
             self._end_grace(now)
@@ -545,6 +563,8 @@ class UsageFeed(object):
                 self._follow()
             return
         self._negatives += 1
+        if self._negatives == 1:
+            self._vanished_at = now     # first seen gone; see _after_standalone
         if self._negatives >= self.LEAD_AFTER and self.standalone is not None:
             log("usage feed: LLM Usage Bar is gone")
             self.standalone = None
@@ -573,15 +593,41 @@ class UsageFeed(object):
         """Take over polling. Everything is read again from disk: the
         standalone's last request and rate limit (Source.__init__ and
         first_poll_at honour them) and what it already announced."""
-        self.role = self.LEADER
+        was, self.role = self.role, self.LEADER
         self.standalone = None
         self._app.sources = {}
         self._app.sync_sources()
+        if was == self.FOLLOWER:
+            self._after_standalone(now)
         self._app.last_notified = load_notify_state(self._app.state_path)
         self._mirrors, self._told = {}, set()
         self._next_poll = now
         self._dirty = True
         log("usage feed: no LLM Usage Bar running; polling here")
+
+    def _after_standalone(self, now):
+        """A standalone before 2.1 writes last_request only when an answer
+        lands. One that went away with a request out - Take over, Close, a
+        crash - left no trace of it, and a source it was due on is due here at
+        once: a second request seconds after its own. Such a source waits
+        poll_min from when the standalone was first seen gone, as if it had
+        asked just then; the cached numbers stay on screen meanwhile.
+
+        2.1 writes the request down when it starts, with in_flight and its
+        pid, so a file like that is taken as it stands - unless the pid is
+        this process's: then the standalone wrote nothing at all while it ran,
+        which is what a 2.0 one with no answer landed yet looks like."""
+        gone_for = max(0.0, now - (self._vanished_at if self._vanished_at is not None else now))
+        wall = time.time()                  # Source's clock, not the feed's
+        vanished = wall - gone_for
+        for src in self._app.sources.values():
+            raw = _read_json(src.poll_path)
+            if isinstance(raw, dict) and "in_flight" in raw and raw.get("pid") != os.getpid():
+                continue
+            if src.next_poll_at <= wall + self.POLL_SECONDS:
+                src.next_poll_at = max(src.next_poll_at, vanished + src.poll_min)
+                log("usage feed: %s: the standalone may have quit with a request out; "
+                    "next poll in %ds" % (src.name, src.next_poll_at - wall))
 
     def _gate(self):
         """Outside the leader role, every way into a request ends at a dropped
@@ -661,6 +707,11 @@ class UsageFeed(object):
     def _start_fetch(self, manual):
         if self._closed:
             return "closed"
+        if self.role == self.LEADER:
+            # Refresh comes between ticks - after a host menu that held the UI
+            # thread for as long as it was open, too - so look again first: a
+            # standalone that started meanwhile is asked instead.
+            self._look(self._clock())
         if self.role == self.STARTING:
             return "starting"
         if self.role == self.FOLLOWER:

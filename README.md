@@ -553,14 +553,22 @@ if feed.tick():
   files, so the pace, a rate limit and what was already announced carry over
   either way. For its first 15 s it only reads, which gives a standalone
   started at the same logon time to take its mutex; it takes the lead only
-  after three probes 2 s apart find none.
+  after three probes 2 s apart find none. While it leads it looks every
+  second and again before a Refresh, so a standalone started in between is
+  never polled on top of. A standalone from before 2.1 writes a request down
+  only once it is answered, so after one goes away the feed waits the 120 s
+  minimum before asking for anything that was due - its last request may
+  still have been out.
 * **A standalone that is already running** is found with `find_standalone()`
   (`OpenMutexW` and `FindWindowW` - it never creates the mutex and sends no
   message) and told things with `ask_standalone("details" | "refresh" | "quit")`,
-  which posts `WM_COMMAND` 1, 2 or 8 to `LLMUsageBarWnd`. Every version since
-  1.0 answers those, and hosts rely on it: **never renumber `CMD_*` in `app.py`,
-  and never rename `LLMUsageBarWnd`, `LLMUsageOverlayWnd` or the mutexes, without
-  a major bump.** The tests check that `embed`'s copies match.
+  which posts `WM_COMMAND` 1, 2 or 8 to `LLMUsageBarWnd` (2.0 and later) or
+  `ClaudeUsageBarWnd` (1.x, before the rename). The numbers have been the same
+  since 1.0, and hosts rely on all of it: **never renumber `CMD_*` in `app.py`,
+  and never rename `LLMUsageBarWnd`, `LLMUsageOverlayWnd` or the mutexes, nor
+  drop the 1.x names `ClaudeUsageBarWnd`, `ClaudeUsageOverlayWnd` and
+  `Local\ClaudeUsageBarMutex` from `embed`, without a major bump.** The tests
+  check that `embed`'s copies match.
 * **The readout**: `render_readout` draws the taskbar readout pixel for pixel,
   through `TaskbarWidget.compose`. The flyout is the real `Flyout`
   (`feed.toggle_flyout()`); `embed.Toast` and `embed.FLUENT` are the toast and the

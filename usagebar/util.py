@@ -32,7 +32,10 @@ def write_json_atomic(path, data, **dump_kw):
     Windows refuses that replace while a reader holds the file open. It is
     tried once more straight away - no sleep, this runs on the UI thread - and
     then the text is written in place, which is exactly what happened before,
-    so it is never worse than that. The tmp file never outlives the call.
+    so it is never worse than that. The same goes for a tmp file that cannot
+    be made at all: the extra characters of its name past MAX_PATH, or no room
+    for a second file on a full disk, while the file itself can still be
+    rewritten. The tmp file never outlives the call.
     Never raises; False when nothing could be written."""
     try:
         text = json.dumps(data, **dump_kw)
@@ -40,14 +43,18 @@ def write_json_atomic(path, data, **dump_kw):
         return False                    # unserialisable: leave the old file whole
     tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        for _ in range(2):
-            try:
-                os.replace(tmp, path)
-                return True
-            except OSError:
-                pass
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError:
+            pass                        # no tmp file: write in place, as before
+        else:
+            for _ in range(2):
+                try:
+                    os.replace(tmp, path)
+                    return True
+                except OSError:
+                    pass
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         return True
