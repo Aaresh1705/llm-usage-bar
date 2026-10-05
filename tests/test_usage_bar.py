@@ -1089,6 +1089,17 @@ def test_window_procedures():
     c.run_deferred()
     check("however many right clicks arrive while one is queued or open",
           c.ran[4:] == [("menu",)], repr(c.ran[4:]))
+    # A click on the readout must not make Windows send to Explorer, whose
+    # taskbar thread shares our input queue: no activation forwarded to the
+    # parent, no WM_PARENTNOTIFY.
+    from usagebar import widget as widgetmod, win32 as w32
+    pending = len(c._deferred)
+    check("WM_MOUSEACTIVATE is answered MA_NOACTIVATE, nothing deferred",
+          widget._on_message(w32.WM_MOUSEACTIVATE, 0, 0) == w32.MA_NOACTIVATE == 3
+          and len(c._deferred) == pending)
+    create = inspect.getsource(widgetmod.TaskbarWidget._create)
+    check("the overlay is created with WS_EX_NOPARENTNOTIFY",
+          w32.WS_EX_NOPARENTNOTIFY == 0x4 and "| WS_EX_NOPARENTNOTIFY" in create)
 
 
 def test_rename():

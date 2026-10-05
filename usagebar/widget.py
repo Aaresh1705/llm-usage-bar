@@ -10,7 +10,7 @@ from .deps import Image, ImageDraw
 from .providers.claude import live_events
 from .render import draw_skull, draw_sparkle, fade_image, load_font, premultiply
 from .util import color_for, hex_to_rgba, human_delta, log, parse_reset
-from .win32 import ABE_BOTTOM, ABE_TOP, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, ERROR_CLASS_ALREADY_EXISTS, GA_PARENT, GWL_STYLE, GW_HWNDPREV, HWND_TOP, SIZE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_THEMECHANGED, WNDCLASS, WNDPROC, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, gdi32, kernel32, taskbar_info, user32, windows_uses_light_theme
+from .win32 import ABE_BOTTOM, ABE_TOP, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, ERROR_CLASS_ALREADY_EXISTS, GA_PARENT, GWL_STYLE, GW_HWNDPREV, HWND_TOP, SIZE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE, MA_NOACTIVATE, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_THEMECHANGED, WNDCLASS, WNDPROC, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOPARENTNOTIFY, WS_EX_TOOLWINDOW, WS_POPUP, gdi32, kernel32, taskbar_info, user32, windows_uses_light_theme
 
 
 def short_error(error):
@@ -136,8 +136,12 @@ class TaskbarWidget(object):
         if not taskbar:
             return False                  # the shell is between lives; try later
 
+        # The window is a child of the taskbar, so the taskbar's thread (in
+        # Explorer) shares our input queue. WS_EX_NOPARENTNOTIFY keeps Windows
+        # from sending Explorer WM_PARENTNOTIFY on every click and on destroy,
+        # each a cross-process send our thread waits on.
         hwnd = user32.CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOPARENTNOTIFY,
             self.CLASS_NAME, "LLM usage", WS_POPUP, 0, 0, 10, 10,
             None, None, kernel32.GetModuleHandleW(None), None)
         if not hwnd:
@@ -164,6 +168,11 @@ class TaskbarWidget(object):
     def _on_message(self, msg, wparam, lparam):
         """Return None for anything we don't handle. Clicks are handed to the
         pump rather than acted on here - see TrayApp.defer."""
+        if msg == WM_MOUSEACTIVATE:
+            # DefWindowProc would forward this to the taskbar and wait on
+            # Explorer. Nothing here wants activating; the flyout takes focus
+            # itself (focus_force).
+            return MA_NOACTIVATE
         if msg == WM_LBUTTONUP:
             self.app.defer(self.app.left_click)
             return 0
