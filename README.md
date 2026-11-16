@@ -345,6 +345,8 @@ and rebuilds, backing off if the shell is not back yet.
 | `background_alpha`, `corner_radius` | Only used when `background` is a colour. |
 | `text_color` / `muted_color` | `auto` follows the Windows theme. |
 | `show_bar`, `bar_height` | The progress bar. |
+| `second_bar` | A thinner bar under it for one more limit, without a number: a limit's key or part of its label (`weekly_scoped` = the model-scoped weekly limit, `"Fable"`, `weekly_all`). `null` = none. One provider only. |
+| `second_bar_colors` | Its colours, as a gradient along the whole track (indigo, purple, pink): the fuller the bar, the hotter its tip. One colour = a plain bar. |
 | `show_reset` | The time to the reset. Drop it to save width. |
 | `show_events`, `event_color` | The sparkle for a live event. |
 | `stale_opacity` | Opacity for numbers that have stopped being refreshed. Judged by age, not by whether the last poll failed. |

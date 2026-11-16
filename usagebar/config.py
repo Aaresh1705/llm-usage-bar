@@ -66,6 +66,8 @@ DEFAULT_CONFIG = {
         "show_bar": True,
         "show_reset": True,
         "bar_height": 4,
+        "second_bar": "weekly_scoped",
+        "second_bar_colors": ["#6366F1", "#A855F7", "#EC4899"],
         "background": "transparent",
         "background_alpha": 255,
         "corner_radius": 6,

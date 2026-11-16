@@ -1486,6 +1486,35 @@ def test_readout():
     check("exactly 128x38, 152x38 and 190x48, veiled or not", all(sizes),
           "%d of %d" % (sum(sizes), len(sizes)))
 
+    print("the second bar")
+    sources = readout_sources("one row")
+    sources[0].usage.limits.append(limit(62, key="weekly_scoped", label="Weekly (Fable)"))
+    rows, event = app.readout_rows(sources, cfg["taskbar_widget"])
+    check("the model's weekly limit rides along as the row's sixth field",
+          rows[0][5] == 62.0, repr(rows))
+    check("and is drawn: the readout is not the one without it",
+          not same(painter(cfg, True).compose(128, 38, rows, event), drawn["one row", True]))
+    found = [app.readout_rows(sources, dict(cfg["taskbar_widget"], second_bar=want))[0][0][5]
+             for want in ("Fable", None, "Opus", "session")]
+    check("found by label too; null, an unknown name or the limit already shown: no bar",
+          found == [62.0, None, None, None], repr(found))
+
+    print("bars are filled from a gradient laid along the whole track")
+    stops = widget.threshold_stops(cfg["thresholds"])
+    tips = []
+    for pct in (30, 60, 85, 100):
+        bar = widget.Image.new("RGBA", (201, 9), (0, 0, 0, 0))
+        widget.fill_bar(bar, (0, 0, 200, 8), pct, stops, (0, 0, 0, 0))
+        tips.append((bar.getpixel((2 * pct - 3, 4)), bar.getpixel((min(200, 2 * pct + 6), 4))[3]))
+    green, amber, red = (widget.hex_to_rgba(t["color"]) for t in cfg["thresholds"])
+    near = lambda a, b: max(abs(x - y) for x, y in zip(a, b)) <= 12
+    check("the tip is each threshold's own colour where the bar reaches it, and nothing past it",
+          near(tips[1][0], amber) and near(tips[2][0], red) and near(tips[3][0], red)
+          and not near(tips[0][0], green) and not near(tips[0][0], amber)
+          and [t[1] for t in tips[:3]] == [0, 0, 0], repr(tips))
+    check("and the start stays the first colour however full the bar is",
+          near(bar.getpixel((4, 4)), green), repr(bar.getpixel((4, 4))))
+
     print("dimming old numbers")
     sources = readout_sources("one row")
     stale = []

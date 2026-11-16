@@ -29,11 +29,55 @@ def short_error(error):
     return "no data"
 
 
+def threshold_stops(thresholds):
+    """The severity colours as fill_bar's stops: each at its own threshold."""
+    return [(float(t["at"]), hex_to_rgba(t["color"])) for t in thresholds]
+
+
+def fill_bar(img, box, pct, stops, track):
+    """A bar in `box` (x0, y0, x1, y1): the track, and `pct` of it filled from
+    a gradient laid along the whole track - `stops` are (at 0-100, rgba). The
+    gradient is not stretched to the fill, so the bar uncovers each colour
+    only where it reaches it: its tip says how far along it is."""
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    h = y1 - y0
+    ImageDraw.Draw(img).rounded_rectangle((x0, y0, x1, y1), radius=h / 2, fill=track)
+    span = (x1 - x0) * max(0.0, min(100.0, pct)) / 100.0
+    if span <= 0:
+        return
+    stops = sorted(stops)
+    pixels = []
+    for i in range(101):                     # a colour per percent, then stretched
+        lo = max((s for s in stops if s[0] <= i), default=stops[0])
+        hi = min((s for s in stops if s[0] > i), default=lo)
+        t = (i - lo[0]) / (hi[0] - lo[0]) if hi[0] > lo[0] <= i else 0.0
+        pixels.append(tuple(int(round(a + (b - a) * t)) for a, b in zip(lo[1], hi[1])))
+    ramp = Image.new("RGBA", (101, 1))
+    ramp.putdata(pixels)
+    ramp = ramp.resize((x1 - x0 + 1, h + 1), Image.BILINEAR)
+    mask = Image.new("L", ramp.size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, max(span, h), h), radius=h / 2, fill=255)
+    img.paste(ramp, (x0, y0), mask)
+
+
+def second_limit(usage, want, primary):
+    """The limit behind the thin second bar: `want` is a limit's key or part of
+    its label ("weekly_scoped", "Fable"). None when no limit matches, or when
+    the only match is the limit the readout already shows."""
+    want = str(want or "").lower()
+    for lim in usage.limits if want else []:
+        if lim is not primary and (lim.get("key") == want
+                                   or want in str(lim.get("label", "")).lower()):
+            return lim
+    return None
+
+
 def readout_rows(sources, widget_cfg):
     """What the readout shows, as plain data: a row per provider of
-    (key, pct, reset time or None, error word or None, stale), and whether a
-    live event earns the sparkle. Kept apart from the window so that an app
-    embedding the usage bar can draw the same readout into a window of its own."""
+    (key, pct, reset time or None, error word or None, stale, second bar's pct
+    or None), and whether a live event earns the sparkle. Kept apart from the
+    window so that an app embedding the usage bar can draw the same readout
+    into a window of its own."""
     rows = []
     for src in sources:
         usage = src.usage
@@ -50,7 +94,9 @@ def readout_rows(sources, widget_cfg):
         # ago is still worth showing at full strength.
         age = usage.age_seconds()
         stale = age is None or age > max(600.0, 2.0 * src.poll_interval() + 60.0)
-        rows.append((src.key, pct, reset, error, stale))
+        second = second_limit(usage, widget_cfg.get("second_bar"), limit) if limit else None
+        rows.append((src.key, pct, reset, error, stale,
+                     float(second["percent"]) if second else None))
     event = (any(live_events(src.usage) for src in sources)
              and bool(widget_cfg.get("show_events", True)))
     return rows, event
@@ -59,7 +105,8 @@ def readout_rows(sources, widget_cfg):
 def readout_key(rows):
     """The rows as they look: a percentage to one decimal and the reset as the
     words it is drawn with, so the readout is redrawn only when that changes."""
-    return tuple((k, round(pct, 1), human_delta(r), e, st) for k, pct, r, e, st in rows)
+    return tuple((k, round(pct, 1), human_delta(r), e, st, None if s is None else round(s, 1))
+                 for k, pct, r, e, st, s in rows)
 
 
 class TaskbarWidget(object):
@@ -383,8 +430,8 @@ class TaskbarWidget(object):
         c = self.cfg()
         sparkle = hex_to_rgba(c.get("event_color", "#F59E0B"))
         if len(rows) == 1:
-            _, pct, reset, error, stale = rows[0]
-            image = self._render(w, h, pct, reset, error)
+            _, pct, reset, error, stale, second = rows[0]
+            image = self._render(w, h, pct, reset, error, second)
             if event:
                 draw_sparkle(image, w, h, sparkle)
             if stale:
@@ -427,7 +474,9 @@ class TaskbarWidget(object):
         # Columns shared by every row - mark, percentage, bar, time to reset -
         # so the bars line up, and are drawn in every row or in none.
         pct_w = reset_w = 0.0
-        for _, pct, reset, error, _ in rows:
+        # ponytail: no second bar here - a row is too short for two bars.
+        # Give each row one if several providers ever need it.
+        for _, pct, reset, error, _, _ in rows:
             if error:
                 continue
             pct = max(0.0, min(100.0, pct))
@@ -441,7 +490,7 @@ class TaskbarWidget(object):
         show_bar = bool(c.get("show_bar", True)) and bar_x1 - bar_x0 > rh * 0.6
         bar_h = max(2 * ss, int(rh * 0.24))
 
-        for i, (key, pct, reset, error, stale) in enumerate(rows):
+        for i, (key, pct, reset, error, stale, _) in enumerate(rows):
             row = Image.new("RGBA", (W, rh), (0, 0, 0, 0))
             d = ImageDraw.Draw(row)
             self._draw_mark(d, key, (0, (rh - m) / 2, m, (rh + m) / 2), fg)
@@ -463,12 +512,8 @@ class TaskbarWidget(object):
                            fill=hex_to_rgba(muted), anchor="rm")
                 if show_bar:
                     y0 = rh / 2 - bar_h / 2
-                    d.rounded_rectangle((bar_x0, y0, bar_x1, y0 + bar_h), radius=bar_h / 2,
-                                        fill=track)
-                    span = (bar_x1 - bar_x0) * pct / 100.0
-                    if span > 0:
-                        d.rounded_rectangle((bar_x0, y0, bar_x0 + max(span, bar_h), y0 + bar_h),
-                                            radius=bar_h / 2, fill=hex_to_rgba(color))
+                    fill_bar(row, (bar_x0, y0, bar_x1, y0 + bar_h), pct,
+                             threshold_stops(self.app.cfg["thresholds"]), track)
             if stale:
                 row = fade_image(row, float(c.get("stale_opacity", 0.55)))
             img.alpha_composite(row, (0, i * rh + (H - rh * len(rows)) // 2))
@@ -490,7 +535,7 @@ class TaskbarWidget(object):
             inner = r * 0.36
             d.ellipse((cx - inner, cy - inner, cx + inner, cy + inner), fill=color)
 
-    def _render(self, w, h, pct, reset, error):
+    def _render(self, w, h, pct, reset, error, second=None):
         c = self.cfg()
         fg, muted, track = self._colors()
         ss = max(1, int(c.get("supersample", 3)))
@@ -548,11 +593,18 @@ class TaskbarWidget(object):
             bar_y = H / 2 - bar_h / 2
 
         if show_bar:
-            d.rounded_rectangle((x0, bar_y, W - 1, bar_y + bar_h), radius=bar_h / 2, fill=track)
-            span = (W - 1 - x0) * pct / 100.0
-            if span > 0:
-                d.rounded_rectangle((x0, bar_y, x0 + max(span, bar_h), bar_y + bar_h),
-                                    radius=bar_h / 2, fill=hex_to_rgba(color))
+            fill_bar(img, (x0, bar_y, W - 1, bar_y + bar_h), pct,
+                     threshold_stops(self.app.cfg["thresholds"]), track)
+            if second is not None:
+                # A second limit under the first, on a track of the same length
+                # so the two fills compare by eye. Half as tall, and in colours
+                # of its own, spread evenly along the track.
+                thin = max(ss, bar_h // 2)
+                y = bar_y + bar_h + thin
+                tones = c.get("second_bar_colors") or ("#6366F1", "#A855F7", "#EC4899")
+                fill_bar(img, (x0, y, W - 1, y + thin), second,
+                         [(i * 100.0 / max(1, len(tones) - 1), hex_to_rgba(tone))
+                          for i, tone in enumerate(tones)], track)
 
         return self._finish(img, w, h)
 
